@@ -8,7 +8,7 @@ require('dotenv').config();
 const User = require('./models/user');
 const Activity = require('./models/Activity');
 const Stats = require('./models/Stats');
-const Admin = require('./models/admin');
+
 
 // Server configuration
 const PORT = process.env.PORT || 5000;
@@ -53,6 +53,24 @@ const authenticate = async (req, res, next) => {
   }
 };
 
+// Add this admin middleware:
+const adminAuthenticate = async (req, res, next) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    if (!token) throw new Error('Authentication required');
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = await User.findById(decoded.userId);
+    if (!user || !user.isAdmin) throw new Error('Admin access required');
+
+    req.user = user;
+    req.token = token;
+    next();
+  } catch (err) {
+    res.status(403).json({ error: 'Admin access required' });
+  }
+};
+
 // Main application setup
 const setupApplication = async () => {
   try {
@@ -60,20 +78,23 @@ const setupApplication = async () => {
     await mongoose.connect(MONGODB_URI);
     console.log('Connected to MongoDB');
 
-/*    // Initialize master admin account
 const initializeMasterAdmin = async () => {
   try {
-    const bcrypt = require('bcryptjs');
-    const masterAdminExists = await Admin.findOne({ isMaster: true });
+    const masterAdminExists = await User.findOne({ isAdmin: true });
     
     if (!masterAdminExists) {
       const hashedPassword = await bcrypt.hash('admin123', 10);
-      const masterAdmin = new Admin({
-        username: 'masteradmin',
+      const masterAdmin = new User({
+        mobile: '6367073699',
         password: hashedPassword,
-        isMaster: true,
-        balance: 1000000, 
-        mobile: 6367073699,// Initial master balance
+        name: 'Master Admin',
+        isAdmin: true,
+        adminPrivileges: {
+          canManageUsers: true,
+          canAdjustBalances: true,
+          canViewTransactions: true
+        },
+        balance: 1000000
       });
       
       await masterAdmin.save();
@@ -82,28 +103,7 @@ const initializeMasterAdmin = async () => {
   } catch (err) {
     console.error('Error initializing master admin:', err);
   }
-};
-
-await initializeMasterAdmin();
-
-    // Authentication middleware (uses the imported User model)
-    const authenticate = async (req, res, next) => {
-      try {
-        const token = req.header('Authorization')?.replace('Bearer ', '');
-        if (!token) throw new Error('Authentication required');
-
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const user = await User.findById(decoded.userId);
-        if (!user) throw new Error('User not found');
-
-        req.user = user;
-        req.token = token;
-        next();
-      } catch (err) {
-        res.status(401).json({ error: 'Please authenticate' });
-      }
-    };
-*/
+};  
     // Import and initialize game routes
     const initializeDiceGame = require('./games/diceroll');
     const { Bet, GameSession } = initializeDiceGame(mongoose);
@@ -288,64 +288,12 @@ await initializeMasterAdmin();
       }
     });
 
-    app.post('/api/admin/login', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    
-    if (!username || !password) {
-      return res.status(400).json({ error: 'Username and password are required' });
-    }
 
-    const admin = await Admin.findOne({ username });
-    if (!admin) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const isMatch = await admin.comparePassword(password);
-    if (!isMatch) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const token = jwt.sign({ adminId: admin._id }, JWT_SECRET, { expiresIn: '1h' });
-    res.json({ token });
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// Admin middleware
-const adminAuthenticate = async (req, res, next) => {
-  try {
-    const token = req.header('Authorization')?.replace('Bearer ', '');
-    if (!token) throw new Error('Authentication required');
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const admin = await Admin.findById(decoded.adminId);
-    if (!admin) throw new Error('Admin not found');
-
-    req.admin = admin;
-    next();
-  } catch (err) {
-    res.status(401).json({ error: 'Please authenticate' });
-  }
-};
-
-// Admin routes
+  // Admin routes - protect with adminAuthenticate middleware
 app.get('/api/admin/users', adminAuthenticate, async (req, res) => {
   try {
     const users = await User.find({}).select('-password');
     res.json(users);
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.get('/api/admin/transactions', adminAuthenticate, async (req, res) => {
-  try {
-    const transactions = await Transaction.find({})
-      .populate('userId', 'mobile name')
-      .sort({ createdAt: -1 });
-    res.json(transactions);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -364,28 +312,24 @@ app.post('/api/admin/adjust-balance', adminAuthenticate, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Get master admin
-    const masterAdmin = await Admin.findOne({ isMaster: true });
-    if (!masterAdmin) {
-      return res.status(500).json({ error: 'Master admin not configured' });
-    }
+    const adminUser = req.user; // The admin user making the request
 
     if (type === 'deposit') {
-      // Transfer from master to user
-      if (masterAdmin.balance < amount) {
-        return res.status(400).json({ error: 'Insufficient master balance' });
+      // Verify admin has enough balance
+      if (adminUser.balance < amount) {
+        return res.status(400).json({ error: 'Insufficient admin balance' });
       }
       
-      masterAdmin.balance -= amount;
+      adminUser.balance -= amount;
       user.balance += amount;
     } else if (type === 'withdraw') {
-      // Transfer from user to master
+      // Verify user has enough balance
       if (user.balance < amount) {
         return res.status(400).json({ error: 'Insufficient user balance' });
       }
       
       user.balance -= amount;
-      masterAdmin.balance += amount;
+      adminUser.balance += amount;
     } else {
       return res.status(400).json({ error: 'Invalid transaction type' });
     }
@@ -393,7 +337,7 @@ app.post('/api/admin/adjust-balance', adminAuthenticate, async (req, res) => {
     // Create transaction record
     const transaction = new Transaction({
       userId: user._id,
-      adminId: req.admin._id,
+      adminId: adminUser._id,
       amount,
       type,
       status: 'completed',
@@ -402,7 +346,7 @@ app.post('/api/admin/adjust-balance', adminAuthenticate, async (req, res) => {
 
     await Promise.all([
       user.save(),
-      masterAdmin.save(),
+      adminUser.save(),
       transaction.save()
     ]);
 
@@ -413,68 +357,11 @@ app.post('/api/admin/adjust-balance', adminAuthenticate, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
-});
+});  
 
-app.put('/api/admin/approve-transaction/:id', adminAuthenticate, async (req, res) => {
-  try {
-    const transaction = await Transaction.findById(req.params.id);
-    if (!transaction) {
-      return res.status(404).json({ error: 'Transaction not found' });
-    }
+  /*  in.comparePassword(password);
 
-    if (transaction.status !== 'pending') {
-      return res.status(400).json({ error: 'Transaction already processed' });
-    }
-
-    const user = await User.findById(transaction.userId);
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    // Get master admin
-    const masterAdmin = await Admin.findOne({ isMaster: true });
-    if (!masterAdmin) {
-      return res.status(500).json({ error: 'Master admin not configured' });
-    }
-
-    if (transaction.type === 'deposit') {
-      // Verify master has enough balance
-      if (masterAdmin.balance < transaction.amount) {
-        return res.status(400).json({ error: 'Insufficient master balance' });
-      }
-      
-      // Transfer from master to user
-      masterAdmin.balance -= transaction.amount;
-      user.balance += transaction.amount;
-    } else if (transaction.type === 'withdraw') {
-      // Verify user has enough balance
-      if (user.balance < transaction.amount) {
-        return res.status(400).json({ error: 'Insufficient user balance' });
-      }
-      
-      // Transfer from user to master
-      user.balance -= transaction.amount;
-      masterAdmin.balance += transaction.amount;
-    }
-
-    transaction.status = 'completed';
-    transaction.processedAt = new Date();
-    transaction.adminId = req.admin._id;
-
-    await Promise.all([
-      user.save(),
-      masterAdmin.save(),
-      transaction.save()
-    ]);
-
-    res.json({ 
-      message: 'Transaction approved successfully',
-      transaction
-    });
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+*/
 
     // Start server
     const server = app.listen(PORT, HOST, () => {
